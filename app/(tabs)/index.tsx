@@ -107,12 +107,16 @@ function sanitizeKey(input: string) {
   return input.toUpperCase().replace(/\s+/g, "_").replace(/[^A-Z0-9_]/g, "");
 }
 
-function lastVoteKey(borderId: string, dir: Dir) {
-  return `kolonakufiri_lastvote_${sanitizeKey(borderId)}_${dir}`;
+/**
+ * ✅ Cooldown lokal per device + per border (PA DIR)
+ * Key = kolonakufiri_lastvote_<borderId>
+ */
+function lastVoteKey(borderId: string) {
+  return `kolonakufiri_lastvote_${sanitizeKey(borderId)}`;
 }
 
-async function getLastVoteMs(borderId: string, dir: Dir): Promise<number> {
-  const key = lastVoteKey(borderId, dir);
+async function getLastVoteMs(borderId: string): Promise<number> {
+  const key = lastVoteKey(borderId);
   if (Platform.OS === "web") {
     const v = globalThis?.localStorage?.getItem(key);
     return v ? Number(v) : 0;
@@ -121,13 +125,38 @@ async function getLastVoteMs(borderId: string, dir: Dir): Promise<number> {
   return v ? Number(v) : 0;
 }
 
-async function setLastVoteMs(borderId: string, dir: Dir, ms: number): Promise<void> {
-  const key = lastVoteKey(borderId, dir);
+async function setLastVoteMs(borderId: string, ms: number): Promise<void> {
+  const key = lastVoteKey(borderId);
   if (Platform.OS === "web") {
     globalThis?.localStorage?.setItem(key, String(ms));
     return;
   }
   await SecureStore.setItemAsync(key, String(ms));
+}
+
+/* ✅ RUJE EDHE VOTEN E FUNDIT (LEVEL) PER BORDER */
+
+function lastVoteLevelKey(borderId: string) {
+  return `kolonakufiri_lastvote_level_${sanitizeKey(borderId)}`;
+}
+
+async function getLastVoteLevel(borderId: string): Promise<number | null> {
+  const key = lastVoteLevelKey(borderId);
+  if (Platform.OS === "web") {
+    const v = globalThis?.localStorage?.getItem(key);
+    return v === null ? null : Number(v);
+  }
+  const v = await SecureStore.getItemAsync(key);
+  return v === null ? null : Number(v);
+}
+
+async function setLastVoteLevel(borderId: string, level: number): Promise<void> {
+  const key = lastVoteLevelKey(borderId);
+  if (Platform.OS === "web") {
+    globalThis?.localStorage?.setItem(key, String(level));
+    return;
+  }
+  await SecureStore.setItemAsync(key, String(level));
 }
 
 /* ===== FLAGS (ONLY FOR KS / NMKD / ALB) ===== */
@@ -167,18 +196,6 @@ function HintWithFlags({ hint, active }: { hint: string; active: boolean }) {
   );
 }
 
-function parseHint(hint?: string) {
-  const parts = (hint || "").split("↔").map((s) => s.trim());
-  const left = parts[0] || "LEFT";
-  const right = parts[1] || "RIGHT";
-  return { left, right };
-}
-
-function dirLabel(border: Border, dir: Dir) {
-  const { left, right } = parseHint(border.hint);
-  return dir === "L2R" ? `${left} → ${right}` : `${right} → ${left}`;
-}
-
 function startOfDayMsLocal(now = new Date()) {
   const d = new Date(now);
   d.setHours(0, 0, 0, 0);
@@ -193,7 +210,7 @@ function computeSmartLevel(reports: Report[]) {
       level: 0,
       count: 0,
       confidence: "Low" as const,
-      buckets: [0, 0, 0, 0],
+      buckets: [0, 0, 0, 0], // [E lirë, E vogël, Mesatare, E ngarkuar]
       avg: 0,
     };
   }
@@ -237,17 +254,14 @@ function computeSmartLevel(reports: Report[]) {
   return { level, count, confidence, buckets, avg };
 }
 
-/* ================= DAILY SUMMARY (PA GRAF) ================= */
+/* ================= DAILY SUMMARY (PA DIR) ================= */
 
-function summarizeDay(reports: Report[], dir: Dir) {
+function summarizeDayAllDirs(reports: Report[]) {
   const counts = [0, 0, 0, 0];
   let sum = 0;
   let total = 0;
 
   for (const r of reports) {
-    const rdir: Dir = r.dir === "R2L" ? "R2L" : "L2R";
-    if (rdir !== dir) continue;
-
     const lvl = clamp(r.waitLevel ?? 0, 0, 3);
     counts[lvl] += 1;
     sum += lvl;
@@ -258,6 +272,11 @@ function summarizeDay(reports: Report[], dir: Dir) {
   return { total, avg, counts };
 }
 
+function dayStatusFromAvg(avg: number) {
+  const level = clamp(Math.round(avg), 0, 3);
+  return statusFromLevel(level);
+}
+
 /* ================= SCREEN ================= */
 
 export default function HomeScreen() {
@@ -265,8 +284,10 @@ export default function HomeScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(null);
 
-  const [dir, setDir] = useState<Dir>("L2R");
   const [reportsToday, setReportsToday] = useState<Report[]>([]);
+
+  // ✅ LAST VOTE (per kete device + border)
+  const [lastVoteLevel, setLastVoteLevelState] = useState<number | null>(null);
 
   const [liveTick, setLiveTick] = useState(0);
   useEffect(() => {
@@ -284,6 +305,20 @@ export default function HomeScreen() {
       }
     })();
   }, []);
+
+  // ✅ kur ndryshon kufiri, lexo voten e fundit te atij kufiri
+  useEffect(() => {
+    (async () => {
+      try {
+        const lvl = await getLastVoteLevel(selected.id);
+        setLastVoteLevelState(
+          typeof lvl === "number" && !Number.isNaN(lvl) ? clamp(lvl, 0, 3) : null
+        );
+      } catch {
+        setLastVoteLevelState(null);
+      }
+    })();
+  }, [selected.id]);
 
   useEffect(() => {
     const qy = query(collection(db, "reports"), where("borderId", "==", selected.id));
@@ -309,7 +344,13 @@ export default function HomeScreen() {
   const live = useMemo(() => computeSmartLevel(liveReports), [liveReports]);
   const status = statusFromLevel(live.level);
 
-  const daySummary = useMemo(() => summarizeDay(reportsToday, dir), [reportsToday, dir]);
+  const daySummary = useMemo(() => summarizeDayAllDirs(reportsToday), [reportsToday]);
+  const dayStatus = useMemo(() => dayStatusFromAvg(daySummary.avg), [daySummary.avg]);
+
+  const lastVoteStatus = useMemo(() => {
+    if (lastVoteLevel === null) return null;
+    return statusFromLevel(clamp(lastVoteLevel, 0, 3));
+  }, [lastVoteLevel]);
 
   async function submit(waitLevel: number) {
     if (submitting) return;
@@ -321,7 +362,7 @@ export default function HomeScreen() {
 
     setSubmitting(true);
     try {
-      const lastMs = await getLastVoteMs(selected.id, dir);
+      const lastMs = await getLastVoteMs(selected.id);
       const now = Date.now();
 
       if (lastMs && now - lastMs < VOTE_COOLDOWN_MS) {
@@ -334,12 +375,15 @@ export default function HomeScreen() {
         borderId: selected.id,
         waitLevel,
         deviceId,
-        dir,
         createdAtMs: now,
         createdAt: serverTimestamp(),
       });
 
-      await setLastVoteMs(selected.id, dir, now);
+      await setLastVoteMs(selected.id, now);
+      await setLastVoteLevel(selected.id, waitLevel); // ✅ ruaje level-in e fundit
+
+      // ✅ update UI menjëherë
+      setLastVoteLevelState(waitLevel);
     } catch (e: any) {
       Alert.alert("Gabim", e?.message ?? "Ndodhi një gabim.");
     } finally {
@@ -368,10 +412,7 @@ export default function HomeScreen() {
             const active = item.id === selected.id;
             return (
               <Pressable
-                onPress={() => {
-                  setSelected(item);
-                  setDir("L2R");
-                }}
+                onPress={() => setSelected(item)}
                 style={[styles.chip, active && styles.chipActive]}
               >
                 <Text style={[styles.chipTitle, active && styles.chipTitleActive]}>
@@ -384,9 +425,19 @@ export default function HomeScreen() {
           }}
         />
 
-        {/* ✅ Home = pa graf: veç karta */}
         <View style={styles.card}>
-          <Text style={styles.blockTitle}>LIVE (reset çdo {LIVE_WINDOW_HOURS}h)</Text>
+          <View style={styles.rowBetween}>
+            <Text style={styles.blockTitle}>LIVE (reset çdo {LIVE_WINDOW_HOURS}h)</Text>
+
+            {/* ✅ ANASH DJATHTE: Last Vote */}
+            <View style={styles.lastVotePill}>
+              <Text style={styles.lastVoteLabel}>Last vote:</Text>
+              <Text style={styles.lastVoteValue}>
+                {lastVoteStatus ? `${lastVoteStatus.emoji} ${lastVoteStatus.title}` : "—"}
+              </Text>
+            </View>
+          </View>
+
           <Text style={styles.live}>
             {status.emoji} {status.title}
           </Text>
@@ -397,73 +448,59 @@ export default function HomeScreen() {
           </Text>
 
           <Text style={styles.breakdown}>
-            🟢 {Math.round(live.buckets[1])} | 🟡 {Math.round(live.buckets[2])} | 🔴{" "}
-            {Math.round(live.buckets[3])}
+            ✅ {Math.round(live.buckets[0])} | 🟢 {Math.round(live.buckets[1])} | 🟡{" "}
+            {Math.round(live.buckets[2])} | 🔴 {Math.round(live.buckets[3])}
           </Text>
 
           <View style={styles.sep} />
 
           <Text style={styles.blockTitle}>SOT (për këtë kufi)</Text>
 
-          <View style={styles.dirRow}>
-            <Pressable
-              onPress={() => setDir("L2R")}
-              style={[styles.dirBtn, dir === "L2R" && styles.dirBtnActive]}
-            >
-              <Text style={[styles.dirText, dir === "L2R" && styles.dirTextActive]}>
-                {dirLabel(selected, "L2R")}
-              </Text>
-            </Pressable>
-
-            <Pressable
-              onPress={() => setDir("R2L")}
-              style={[styles.dirBtn, dir === "R2L" && styles.dirBtnActive]}
-            >
-              <Text style={[styles.dirText, dir === "R2L" && styles.dirTextActive]}>
-                {dirLabel(selected, "R2L")}
-              </Text>
-            </Pressable>
-          </View>
-
           <Text style={styles.meta}>
             Total: <Text style={styles.metaStrong}>{daySummary.total}</Text> raporte
           </Text>
+
           <Text style={styles.meta}>
-            Mesatarja:{" "}
-            <Text style={styles.metaStrong}>{daySummary.avg.toFixed(2)}</Text>
+            Gjendja:{" "}
+            <Text style={styles.metaStrong}>
+              {dayStatus.emoji} {dayStatus.title}
+            </Text>
           </Text>
+
           <Text style={styles.breakdown}>
             ✅ {daySummary.counts[0]} | 🟢 {daySummary.counts[1]} | 🟡{" "}
             {daySummary.counts[2]} | 🔴 {daySummary.counts[3]}
           </Text>
 
           <Text style={styles.cooldownNote}>
-            TEST Limit: 1 votë / 1 minutë / për device (për këtë kufi + këtë anë)
+            TEST Limit: 1 votë / 1 minutë / për device (për këtë kufi)
           </Text>
         </View>
 
         <Text style={styles.section}>Raporto gjendjen</Text>
 
-        <Pressable
-          style={[styles.bigBtn, disabled && styles.disabled]}
-          onPress={() => submit(0)}
-        >
-          <Text style={styles.bigBtnText}>A ka kolonë ?</Text>
-        </Pressable>
+        <View style={styles.rowWrap}>
+          <Pressable
+            style={[styles.smallBtn, disabled && styles.disabled]}
+            onPress={() => submit(0)}
+          >
+            <Text style={styles.smallBtnText}>✅ E lirë</Text>
+          </Pressable>
 
-        <View style={styles.row}>
           <Pressable
             style={[styles.smallBtn, disabled && styles.disabled]}
             onPress={() => submit(1)}
           >
             <Text style={styles.smallBtnText}>🟢 E vogël</Text>
           </Pressable>
+
           <Pressable
             style={[styles.smallBtn, disabled && styles.disabled]}
             onPress={() => submit(2)}
           >
             <Text style={styles.smallBtnText}>🟡 Mesatare</Text>
           </Pressable>
+
           <Pressable
             style={[styles.smallBtn, disabled && styles.disabled]}
             onPress={() => submit(3)}
@@ -520,6 +557,27 @@ const styles = StyleSheet.create({
     padding: 16,
   },
 
+  rowBetween: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+
+  lastVotePill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#0e141c",
+  },
+  lastVoteLabel: { color: MUTED, fontSize: 11, fontWeight: "800" },
+  lastVoteValue: { color: TEXT, fontSize: 11, fontWeight: "900" },
+
   blockTitle: { color: TEXT, fontWeight: "900", marginBottom: 6 },
   live: { fontSize: 24, fontWeight: "900", color: TEXT },
   desc: { color: MUTED, marginTop: 6 },
@@ -532,32 +590,14 @@ const styles = StyleSheet.create({
 
   section: { color: TEXT, fontWeight: "800", marginTop: 10 },
 
-  dirRow: { flexDirection: "row", gap: 10, marginTop: 8 },
-  dirBtn: {
-    flex: 1,
-    backgroundColor: "#0e141c",
-    borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 14,
-    paddingVertical: 10,
-    paddingHorizontal: 10,
-    alignItems: "center",
+  rowWrap: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
   },
-  dirBtnActive: { backgroundColor: "#fff", borderColor: "#fff" },
-  dirText: { color: TEXT, fontWeight: "900", fontSize: 12 },
-  dirTextActive: { color: "#000" },
 
-  bigBtn: {
-    backgroundColor: "#10261b",
-    borderRadius: 18,
-    paddingVertical: 16,
-    alignItems: "center",
-  },
-  bigBtnText: { color: TEXT, fontWeight: "900", fontSize: 16 },
-
-  row: { flexDirection: "row", gap: 10 },
   smallBtn: {
-    flex: 1,
+    flexBasis: "48%",
     backgroundColor: "#0e141c",
     borderWidth: 1,
     borderColor: BORDER,
