@@ -42,6 +42,16 @@ type Report = {
   dir?: Dir;
 };
 
+type ApiTraffic = {
+  status: "FREE" | "MEDIUM" | "HEAVY" | "UNKNOWN";
+  label: string;
+  updatedAtMs: number;
+  cached?: boolean;
+  ratio?: number | null; // currentSpeed/freeFlowSpeed
+  currentSpeed?: number | null;
+  freeFlowSpeed?: number | null;
+};
+
 /* ================= DATA ================= */
 
 const BORDERS: Border[] = [
@@ -58,6 +68,22 @@ const LIVE_WINDOW_MS = LIVE_WINDOW_HOURS * 60 * 60 * 1000;
 const VOTE_COOLDOWN_MS = 60 * 1000;
 const DEVICE_KEY = "kolonakufiri_device_id";
 
+/* ================= TOMTOM (DIRECT) SETTINGS ================= */
+
+// ✅ VENDOSE KEY KETU (për MVP)
+// ⚠️ Mos e shty në GitHub. Kur ta bësh prodhim, e kalon në server/worker.
+const TOMTOM_KEY = "CggQRwzwUoVB0QXQeuP1FrV5MksVBerA";
+
+// ✅ Pikat te segmenti i Hanit të Elezit (approx është OK)
+const HAN_ELEZI_POINTS = [
+  { lat: 42.1569, lon: 21.3051 }, // para kufirit (KS)
+  { lat: 42.1584, lon: 21.2990 }, // te terminali
+  { lat: 42.1602, lon: 21.2928 }, // pas kufirit (NMKD)
+];
+
+// ✅ Cache lokal (mos e harxho limitin)
+const API_CACHE_MS = 90 * 1000;
+
 /* ================= HELPERS ================= */
 
 function clamp(n: number, a: number, b: number) {
@@ -71,6 +97,29 @@ function statusFromLevel(level: number) {
   if (level === 2)
     return { title: "Mesatare", emoji: "🟡", desc: "Pritje normale" };
   return { title: "E ngarkuar", emoji: "🔴", desc: "Pritje e gjatë" };
+}
+
+// Ratio -> status (3 nivele)
+function apiStatusFromRatio(ratio: number): ApiTraffic["status"] {
+  if (!Number.isFinite(ratio)) return "UNKNOWN";
+  if (ratio >= 0.8) return "FREE";
+  if (ratio >= 0.5) return "MEDIUM";
+  return "HEAVY";
+}
+
+function apiLabelFromStatus(status: ApiTraffic["status"]) {
+  if (status === "FREE") return "E lirë";
+  if (status === "MEDIUM") return "Mesatare";
+  if (status === "HEAVY") return "E ngarkuar";
+  return "N/A";
+}
+
+// Mapping API -> level (0..3)
+function levelFromApiStatus(s: ApiTraffic["status"]): number {
+  if (s === "FREE") return 0;
+  if (s === "MEDIUM") return 2; // 🟡 Mesatare
+  if (s === "HEAVY") return 3; // 🔴 E ngarkuar
+  return 0;
 }
 
 function bytesToHex(bytes: Uint8Array) {
@@ -107,10 +156,6 @@ function sanitizeKey(input: string) {
   return input.toUpperCase().replace(/\s+/g, "_").replace(/[^A-Z0-9_]/g, "");
 }
 
-/**
- * ✅ Cooldown lokal per device + per border (PA DIR)
- * Key = kolonakufiri_lastvote_<borderId>
- */
 function lastVoteKey(borderId: string) {
   return `kolonakufiri_lastvote_${sanitizeKey(borderId)}`;
 }
@@ -133,8 +178,6 @@ async function setLastVoteMs(borderId: string, ms: number): Promise<void> {
   }
   await SecureStore.setItemAsync(key, String(ms));
 }
-
-/* ✅ RUJE EDHE VOTEN E FUNDIT (LEVEL) PER BORDER */
 
 function lastVoteLevelKey(borderId: string) {
   return `kolonakufiri_lastvote_level_${sanitizeKey(borderId)}`;
@@ -159,7 +202,7 @@ async function setLastVoteLevel(borderId: string, level: number): Promise<void> 
   await SecureStore.setItemAsync(key, String(level));
 }
 
-/* ===== FLAGS (ONLY FOR KS / NMKD / ALB) ===== */
+/* ===== FLAGS ===== */
 
 function flagFor(code: string) {
   const c = code.toUpperCase();
@@ -202,7 +245,7 @@ function startOfDayMsLocal(now = new Date()) {
   return d.getTime();
 }
 
-/* ================= LIVE STATUS CALC ================= */
+/* ================= LIVE STATUS CALC (VOTES) ================= */
 
 function computeSmartLevel(reports: Report[]) {
   if (!reports.length) {
@@ -210,7 +253,7 @@ function computeSmartLevel(reports: Report[]) {
       level: 0,
       count: 0,
       confidence: "Low" as const,
-      buckets: [0, 0, 0, 0], // [E lirë, E vogël, Mesatare, E ngarkuar]
+      buckets: [0, 0, 0, 0],
       avg: 0,
     };
   }
@@ -254,7 +297,7 @@ function computeSmartLevel(reports: Report[]) {
   return { level, count, confidence, buckets, avg };
 }
 
-/* ================= DAILY SUMMARY (PA DIR) ================= */
+/* ================= DAILY SUMMARY ================= */
 
 function summarizeDayAllDirs(reports: Report[]) {
   const counts = [0, 0, 0, 0];
@@ -277,6 +320,68 @@ function dayStatusFromAvg(avg: number) {
   return statusFromLevel(level);
 }
 
+/* ================= TOMTOM FETCH (DIRECT) ================= */
+
+let apiCache: { ts: number; data: ApiTraffic | null } = { ts: 0, data: null };
+
+async function fetchTomTomFlow(lat: number, lon: number) {
+  const url =
+    `https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json` +
+    `?point=${encodeURIComponent(`${lat},${lon}`)}` +
+    `&unit=KMPH` +
+    `&key=${encodeURIComponent(TOMTOM_KEY)}`;
+
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!res.ok) {
+    const msg = json?.error?.description || json?.error || "TomTom error";
+    throw new Error(msg);
+  }
+  return json;
+}
+
+async function getHanEleziTrafficDirect(): Promise<ApiTraffic> {
+  const now = Date.now();
+  if (apiCache.data && now - apiCache.ts < API_CACHE_MS) {
+    return { ...apiCache.data, cached: true };
+  }
+
+  if (!TOMTOM_KEY || TOMTOM_KEY === "CggQRwzwUoVB0QXQeuP1FrV5MksVBerA") {
+    throw new Error("Vendose TOMTOM_KEY në kod (për MVP).");
+  }
+
+  // Merr flow për secilën pikë, zgjedh “më të keqin” (min ratio)
+  const results = await Promise.all(
+    HAN_ELEZI_POINTS.map(async (p) => {
+      const j = await fetchTomTomFlow(p.lat, p.lon);
+      const d = j?.flowSegmentData || {};
+      const currentSpeed = Number(d.currentSpeed);
+      const freeFlowSpeed = Number(d.freeFlowSpeed);
+      const ratio = freeFlowSpeed > 0 ? currentSpeed / freeFlowSpeed : NaN;
+      return { currentSpeed, freeFlowSpeed, ratio };
+    })
+  );
+
+  const worst = results
+    .filter((r) => Number.isFinite(r.ratio))
+    .sort((a, b) => a.ratio - b.ratio)[0];
+
+  const ratio = worst?.ratio ?? NaN;
+  const status = apiStatusFromRatio(ratio);
+  const data: ApiTraffic = {
+    status,
+    label: apiLabelFromStatus(status),
+    updatedAtMs: Date.now(),
+    ratio: Number.isFinite(ratio) ? ratio : null,
+    currentSpeed: worst?.currentSpeed ?? null,
+    freeFlowSpeed: worst?.freeFlowSpeed ?? null,
+    cached: false,
+  };
+
+  apiCache = { ts: now, data };
+  return data;
+}
+
 /* ================= SCREEN ================= */
 
 export default function HomeScreen() {
@@ -286,8 +391,14 @@ export default function HomeScreen() {
 
   const [reportsToday, setReportsToday] = useState<Report[]>([]);
 
-  // ✅ LAST VOTE (per kete device + border)
   const [lastVoteLevel, setLastVoteLevelState] = useState<number | null>(null);
+
+  // ✅ API traffic (direct) për Han i Elezit
+  const [apiTraffic, setApiTraffic] = useState<ApiTraffic | null>(null);
+  const [apiLoading, setApiLoading] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
+
+  const isHanElezi = selected.id === "HANI_I_ELEZIT";
 
   const [liveTick, setLiveTick] = useState(0);
   useEffect(() => {
@@ -306,7 +417,6 @@ export default function HomeScreen() {
     })();
   }, []);
 
-  // ✅ kur ndryshon kufiri, lexo voten e fundit te atij kufiri
   useEffect(() => {
     (async () => {
       try {
@@ -335,14 +445,53 @@ export default function HomeScreen() {
     return () => unsub();
   }, [selected.id]);
 
+  // ✅ DIRECT TomTom load (vetëm kur është Han i Elezit)
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadApi() {
+      if (!isHanElezi) {
+        setApiTraffic(null);
+        setApiError(null);
+        setApiLoading(false);
+        return;
+      }
+
+      setApiLoading(true);
+      setApiError(null);
+      try {
+        const data = await getHanEleziTrafficDirect();
+        if (!cancelled) setApiTraffic(data);
+      } catch (e: any) {
+        if (!cancelled) setApiError(e?.message ?? "S’po mundem me marrë trafikun.");
+      } finally {
+        if (!cancelled) setApiLoading(false);
+      }
+    }
+
+    loadApi();
+    const t = setInterval(loadApi, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [isHanElezi]);
+
   const liveReports = useMemo(() => {
     void liveTick;
     const since = Date.now() - LIVE_WINDOW_MS;
     return reportsToday.filter((r) => r.createdAtMs >= since);
   }, [reportsToday, liveTick]);
 
-  const live = useMemo(() => computeSmartLevel(liveReports), [liveReports]);
-  const status = statusFromLevel(live.level);
+  const liveVotes = useMemo(() => computeSmartLevel(liveReports), [liveReports]);
+
+  // ✅ LIVE level final: Han i Elezit -> API (nëse ka), përndryshe -> votat
+  const liveLevel = useMemo(() => {
+    if (isHanElezi && apiTraffic) return levelFromApiStatus(apiTraffic.status);
+    return liveVotes.level;
+  }, [isHanElezi, apiTraffic, liveVotes.level]);
+
+  const status = useMemo(() => statusFromLevel(liveLevel), [liveLevel]);
 
   const daySummary = useMemo(() => summarizeDayAllDirs(reportsToday), [reportsToday]);
   const dayStatus = useMemo(() => dayStatusFromAvg(daySummary.avg), [daySummary.avg]);
@@ -380,9 +529,7 @@ export default function HomeScreen() {
       });
 
       await setLastVoteMs(selected.id, now);
-      await setLastVoteLevel(selected.id, waitLevel); // ✅ ruaje level-in e fundit
-
-      // ✅ update UI menjëherë
+      await setLastVoteLevel(selected.id, waitLevel);
       setLastVoteLevelState(waitLevel);
     } catch (e: any) {
       Alert.alert("Gabim", e?.message ?? "Ndodhi një gabim.");
@@ -429,7 +576,6 @@ export default function HomeScreen() {
           <View style={styles.rowBetween}>
             <Text style={styles.blockTitle}>LIVE (reset çdo {LIVE_WINDOW_HOURS}h)</Text>
 
-            {/* ✅ ANASH DJATHTE: Last Vote */}
             <View style={styles.lastVotePill}>
               <Text style={styles.lastVoteLabel}>Last vote:</Text>
               <Text style={styles.lastVoteValue}>
@@ -438,19 +584,42 @@ export default function HomeScreen() {
             </View>
           </View>
 
+          {isHanElezi ? (
+            <View style={styles.apiBox}>
+              <Text style={styles.apiTitle}>Traffic API (Han i Elezit)</Text>
+              <Text style={styles.apiSub}>
+                Pika reference: {HAN_ELEZI_POINTS.length} •{" "}
+                {apiLoading ? "Duke lexu..." : apiTraffic ? "OK" : "N/A"}
+              </Text>
+              {apiError ? <Text style={styles.apiError}>⚠️ {apiError}</Text> : null}
+              {apiTraffic ? (
+                <Text style={styles.apiSub}>
+                  Source: TomTom • Updated:{" "}
+                  {new Date(apiTraffic.updatedAtMs).toLocaleTimeString()}
+                  {apiTraffic.cached ? " (cache)" : ""}{" "}
+                  {apiTraffic.ratio != null ? `• ratio: ${apiTraffic.ratio.toFixed(2)}` : ""}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
+
           <Text style={styles.live}>
             {status.emoji} {status.title}
           </Text>
           <Text style={styles.desc}>{status.desc}</Text>
 
           <Text style={styles.meta}>
-            {live.count} raporte (2h) • Confidence: {live.confidence}
+            {isHanElezi
+              ? `Source: API${apiTraffic?.cached ? " (cache)" : ""}`
+              : `${liveVotes.count} raporte (2h) • Confidence: ${liveVotes.confidence}`}
           </Text>
 
-          <Text style={styles.breakdown}>
-            ✅ {Math.round(live.buckets[0])} | 🟢 {Math.round(live.buckets[1])} | 🟡{" "}
-            {Math.round(live.buckets[2])} | 🔴 {Math.round(live.buckets[3])}
-          </Text>
+          {!isHanElezi ? (
+            <Text style={styles.breakdown}>
+              ✅ {Math.round(liveVotes.buckets[0])} | 🟢 {Math.round(liveVotes.buckets[1])} | 🟡{" "}
+              {Math.round(liveVotes.buckets[2])} | 🔴 {Math.round(liveVotes.buckets[3])}
+            </Text>
+          ) : null}
 
           <View style={styles.sep} />
 
@@ -577,6 +746,19 @@ const styles = StyleSheet.create({
   },
   lastVoteLabel: { color: MUTED, fontSize: 11, fontWeight: "800" },
   lastVoteValue: { color: TEXT, fontSize: 11, fontWeight: "900" },
+
+  apiBox: {
+    marginTop: 10,
+    marginBottom: 8,
+    padding: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+    backgroundColor: "#0e141c",
+  },
+  apiTitle: { color: TEXT, fontWeight: "900", marginBottom: 4 },
+  apiSub: { color: MUTED, fontSize: 12, lineHeight: 18 },
+  apiError: { color: "#ffb3b3", fontSize: 12, marginTop: 6, fontWeight: "800" },
 
   blockTitle: { color: TEXT, fontWeight: "900", marginBottom: 6 },
   live: { fontSize: 24, fontWeight: "900", color: TEXT },
